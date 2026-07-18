@@ -566,19 +566,22 @@ class Agent:
             deferred_tool_calls: list[ToolCallComplete] = []
             llm_stream = self.client.stream(conversation, system=system, tools=tools)
             async for event in collector.consume(llm_stream):
-                # 流式工具执行：收到完整 tool_use 就立刻提交执行，不等整个响应结束
                 if isinstance(event, ToolUseEvent):
                     tc = collector.response.tool_calls[-1]
-                    # 需要交互式权限确认的工具延迟到流结束后顺序执行
                     tool = self.registry.get(tc.tool_name)
-                    needs_ask = False
-                    if tool and self.permission_checker:
+                    can_stream = (
+                        tool is not None
+                        and tool.is_concurrency_safe
+                        and self.registry.is_enabled(tc.tool_name)
+                    )
+                    if can_stream and self.permission_checker:
                         decision = self.permission_checker.check(tool, tc.arguments)
-                        needs_ask = decision.effect == "ask"
-                    if needs_ask:
-                        deferred_tool_calls.append(tc)
-                    else:
+                        can_stream = decision.effect == "allow"
+
+                    if can_stream:
                         executor.submit(self._execute_single_tool_direct(tc))
+                    else:
+                        deferred_tool_calls.append(tc)
                 yield event
 
             response = collector.response
@@ -679,34 +682,32 @@ class Agent:
                 response.cache_creation,
             )
 
-            # 收集流式执行器中已提交的工具结果（工具在 LLM 流式输出期间已开始执行）
             tool_results: list[ToolResultBlock] = []
             streaming_results = await executor.collect_results()
 
-            for br in streaming_results:
-                if br.is_unknown:
+            for item in streaming_results:
+                if item.is_unknown:
                     consecutive_unknown += 1
                 else:
                     consecutive_unknown = 0
                 content = self._maybe_persist_or_truncate(
-                    br.tool_id, br.result.output
+                    item.tool_id, item.result.output
                 )
                 tool_results.append(
                     ToolResultBlock(
-                        tool_use_id=br.tool_id,
+                        tool_use_id=item.tool_id,
                         content=content,
-                        is_error=br.result.is_error,
+                        is_error=item.result.is_error,
                     )
                 )
                 yield ToolResultEvent(
-                    tool_id=br.tool_id,
-                    tool_name=br.tool_name,
-                    output=br.result.output,
-                    is_error=br.result.is_error,
-                    elapsed=br.elapsed,
+                    tool_id=item.tool_id,
+                    tool_name=item.tool_name,
+                    output=item.result.output,
+                    is_error=item.result.is_error,
+                    elapsed=item.elapsed,
                 )
 
-            # 需要交互式权限确认的工具，在流结束后顺序执行
             for tc in deferred_tool_calls:
                 result: ToolResult | None = None
                 elapsed = 0.0
@@ -719,14 +720,19 @@ class Agent:
                         result, elapsed, is_unknown = item
 
                 if result is None:
-                    result = ToolResult(output="Error: no result from tool", is_error=True)
+                    result = ToolResult(
+                        output="Error: no result from tool",
+                        is_error=True,
+                    )
 
                 if is_unknown:
                     consecutive_unknown += 1
                 else:
                     consecutive_unknown = 0
 
-                content = self._maybe_persist_or_truncate(tc.tool_id, result.output)
+                content = self._maybe_persist_or_truncate(
+                    tc.tool_id, result.output
+                )
                 tool_results.append(
                     ToolResultBlock(
                         tool_use_id=tc.tool_id,
@@ -829,6 +835,20 @@ class Agent:
                     tool_id=tc.tool_id,
                     tool_name=tc.tool_name,
                     result=ToolResult(output=f"Permission denied: {decision.reason}", is_error=True),
+                    elapsed=time.monotonic() - start,
+                    is_unknown=False,
+                )
+            if decision.effect == "ask":
+                return _ToolExecResult(
+                    tool_id=tc.tool_id,
+                    tool_name=tc.tool_name,
+                    result=ToolResult(
+                        output=(
+                            "Permission confirmation required; "
+                            "direct execution refused"
+                        ),
+                        is_error=True,
+                    ),
                     elapsed=time.monotonic() - start,
                     is_unknown=False,
                 )

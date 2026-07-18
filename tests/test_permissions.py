@@ -572,6 +572,59 @@ async def test_e2e_default_mode_write_triggers_ask():
     assert len(c["tool_result"]) == 1
     assert not c["tool_result"][0].is_error
 
+
+@pytest.mark.asyncio
+async def test_concurrency_safe_calls_cannot_bypass_permission_ask():
+    """An ask decision forces even concurrency-safe calls onto the serial path."""
+    tmpdir = Path(tempfile.mkdtemp())
+    client = MockLLMClient([
+        [
+            ToolCallComplete("t1", "WriteFile", {
+                "file_path": str(tmpdir / "one.txt"),
+                "content": "one",
+            }),
+            ToolCallComplete("t2", "WriteFile", {
+                "file_path": str(tmpdir / "two.txt"),
+                "content": "two",
+            }),
+            StreamEnd("end_turn", input_tokens=10, output_tokens=20),
+        ],
+        [
+            TextDelta("Done."),
+            StreamEnd("end_turn", input_tokens=30, output_tokens=15),
+        ],
+    ])
+    registry = create_default_registry()
+    # Force the scheduler's parallel eligibility path. Permission must still
+    # take precedence over the tool's concurrency declaration.
+    registry.get("WriteFile").is_concurrency_safe = True
+    checker = PermissionChecker(
+        detector=DangerousCommandDetector(),
+        sandbox=PathSandbox(str(tmpdir)),
+        rule_engine=RuleEngine(),
+        mode=PermissionMode.DEFAULT,
+    )
+    agent = Agent(
+        client,
+        registry,
+        "anthropic",
+        work_dir=str(tmpdir),
+        permission_checker=checker,
+    )
+    conv = ConversationManager()
+    conv.add_user_message("Write two files")
+
+    events = []
+    async for event in agent.run(conv):
+        events.append(event)
+        if isinstance(event, PermissionRequest):
+            event.future.set_result(PermissionResponse.ALLOW)
+
+    c = _collect(events)
+    assert len(c["permission"]) == 2
+    assert len(c["tool_result"]) == 2
+    assert all(not result.is_error for result in c["tool_result"])
+
 @pytest.mark.asyncio
 async def test_e2e_bypass_mode_allows_all():
     """Bypass 模式无需询问，放行一切操作。"""
